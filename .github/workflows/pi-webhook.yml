@@ -1,0 +1,82 @@
+name: Send Custom Webhook on Push to PI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  send_pi_webhook:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Ensures full commit history is available
+
+      # Step 2: Get changed files using tj-actions/changed-files
+      - name: Get changed files
+        uses: tj-actions/changed-files@v45
+        id: changed_files
+        with:
+          files: |
+            docs/**  # Only include changes within the 'docs' directory
+
+      # Step 3: Prepare and send webhook payload
+      - name: Prepare and send webhook payload
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ADDED_FILES: ${{ steps.changed_files.outputs.added }}
+          REMOVED_FILES: ${{ steps.changed_files.outputs.removed }}
+          MODIFIED_FILES: ${{ steps.changed_files.outputs.modified }}
+        run: |
+          # Install jq if not already available
+          sudo apt-get update && sudo apt-get install -y jq
+
+          # Construct the payload JSON
+          payload=$(jq -n \
+            --argjson added "$(echo "${ADDED_FILES}" | jq -R 'split(",") | map(select(length > 0))')" \
+            --argjson removed "$(echo "${REMOVED_FILES}" | jq -R 'split(",") | map(select(length > 0))')" \
+            --argjson modified "$(echo "${MODIFIED_FILES}" | jq -R 'split(",") | map(select(length > 0))')" \
+            '{
+              "added": $added,
+              "removed": $removed,
+              "modified": $modified,
+              "ref": "${GITHUB_REF}",
+              "repository": "${GITHUB_REPOSITORY}",
+              "pusher": "${GITHUB_ACTOR}",
+              "commit_count": "${{ github.event.commits | length }}"
+            }')
+
+          echo "Constructed Payload: $payload"
+
+          # Generate HMAC SHA256 signature
+          signature=$(echo -n "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
+
+          echo "Generated Signature: sha256=$signature"
+
+          # Send the webhook
+          response=$(curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$signature" \
+            -H "X-GitHub-Event: push" \
+            -d "$payload" \
+            -w "\n%{http_code}" \
+            -s)
+
+          # Extract HTTP status and response body
+          http_status=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | sed '$d')
+
+          echo "HTTP Status: $http_status"
+          echo "Response body: $response_body"
+
+          # Check if the webhook was sent successfully
+          if [ "$http_status" -ge 200 ] && [ "$http_status" -lt 300 ]; then
+            echo "Webhook sent successfully"
+          else
+            echo "Failed to send webhook"
+            exit 1
+          fi
